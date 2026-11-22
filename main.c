@@ -16,6 +16,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 PSP_MODULE_INFO("DarkCorridor", PSP_MODULE_USER, 0, 1);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
@@ -80,6 +81,12 @@ typedef struct {
 static Voice g_voices[MAXV];
 static volatile int g_audioRun = 1;
 static u32 g_arng = 777u;
+static float g_sinTab[1024];
+
+static float fsin(float ph01)   /* ph01 в [0,1) */
+{
+    return g_sinTab[((int)(ph01 * 1024.0f)) & 1023];
+}
 
 static float arnd(void)
 {
@@ -186,17 +193,18 @@ static int audio_thread(SceSize args, void *argp)
     int ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, AUDIO_SAMPLES, PSP_AUDIO_FORMAT_STEREO);
     if (ch < 0) return 0;
 
-    float ph1 = 0.0f, ph2 = 0.0f, lfo = 0.0f, wind = 0.0f;
+    float ph1 = 0.0f, ph2 = 0.0f, lfo = 0.0f, lfo2 = 0.0f, wind = 0.0f;
 
     while (g_audioRun) {
         for (int i = 0; i < AUDIO_SAMPLES; i++) {
-            ph1 += TWO_PI * 52.0f / SR;   if (ph1 > TWO_PI) ph1 -= TWO_PI;
-            ph2 += TWO_PI * 53.7f / SR;   if (ph2 > TWO_PI) ph2 -= TWO_PI;
-            lfo += TWO_PI * 0.07f / SR;   if (lfo > TWO_PI * 10.0f) lfo -= TWO_PI * 10.0f;
+            ph1  += 52.0f  / SR; if (ph1  >= 1.0f) ph1  -= 1.0f;
+            ph2  += 53.7f  / SR; if (ph2  >= 1.0f) ph2  -= 1.0f;
+            lfo  += 0.07f  / SR; if (lfo  >= 1.0f) lfo  -= 1.0f;
+            lfo2 += 0.119f / SR; if (lfo2 >= 1.0f) lfo2 -= 1.0f;
             wind += (arnd() - wind) * 0.004f;
 
-            float amb = (sinf(ph1) * 0.09f + sinf(ph2) * 0.08f) * (0.7f + 0.3f * sinf(lfo))
-                      + wind * 0.9f * (0.4f + 0.6f * (0.5f + 0.5f * sinf(lfo * 1.7f)));
+            float amb = (fsin(ph1) * 0.09f + fsin(ph2) * 0.08f) * (0.7f + 0.3f * fsin(lfo))
+                      + wind * 0.9f * (0.4f + 0.6f * (0.5f + 0.5f * fsin(lfo2)));
             float L = amb, R = amb;
 
             for (int k = 0; k < MAXV; k++) {
@@ -221,6 +229,7 @@ static int audio_thread(SceSize args, void *argp)
 static void start_audio(void)
 {
     gen_sounds();
+    for (int i = 0; i < 1024; i++) g_sinTab[i] = sinf(TWO_PI * (float)i / 1024.0f);
     for (int i = 0; i < MAXV; i++) { g_voices[i].pos = 0; g_voices[i].len = 0; }
     int thid = sceKernelCreateThread("audio", audio_thread, 0x12, 0x10000, 0, NULL);
     if (thid >= 0) sceKernelStartThread(thid, 0, NULL);
@@ -231,7 +240,8 @@ static void start_audio(void)
 /* ================================================================== */
 #define TEX_SIZE 64
 enum { T_WALL, T_FLOOR, T_CEIL, T_WOOD, T_METAL, T_PAPER, T_COUNT };
-static u32 g_tex[T_COUNT][TEX_SIZE * TEX_SIZE] __attribute__((aligned(16)));
+static unsigned short g_tex[T_COUNT][TEX_SIZE * TEX_SIZE] __attribute__((aligned(16)));
+static unsigned short g_texSw[T_COUNT][TEX_SIZE * TEX_SIZE] __attribute__((aligned(16)));
 
 static u32 hash2(int x, int y)
 {
@@ -273,6 +283,25 @@ static u32 pack_rgb(float r, float g, float b)
     return COL(R, G, B);
 }
 
+static unsigned short pack565(float r, float g, float b)
+{
+    int R = (int)clampf(r, 0.0f, 255.0f);
+    int G = (int)clampf(g, 0.0f, 255.0f);
+    int B = (int)clampf(b, 0.0f, 255.0f);
+    return (unsigned short)((R >> 3) | ((G >> 2) << 5) | ((B >> 3) << 11));
+}
+
+static void swizzle_tex(unsigned char *out, const unsigned char *in, int wbytes, int height)
+{
+    int rowblocks = wbytes / 16;
+    for (int j = 0; j < height; j++) {
+        for (int i = 0; i < wbytes; i++) {
+            int blockaddr = ((i / 16) + (j / 8) * rowblocks) * 16 * 8;
+            out[blockaddr + (i % 16) + (j % 8) * 16] = in[i + j * wbytes];
+        }
+    }
+}
+
 static void gen_textures(void)
 {
     for (int y = 0; y < TEX_SIZE; y++) {
@@ -291,7 +320,7 @@ static void gen_textures(void)
                 r = lerpf(r, 52.0f, stain * 0.6f);
                 g = lerpf(g, 40.0f, stain * 0.6f);
                 b = lerpf(b, 26.0f, stain * 0.6f);
-                g_tex[T_WALL][y * TEX_SIZE + x] = pack_rgb(r, g, b);
+                g_tex[T_WALL][y * TEX_SIZE + x] = pack565(r, g, b);
             }
             /* --- пол: плитка 16px с затёртыми швами --- */
             {
@@ -302,14 +331,14 @@ static void gen_textures(void)
                 g = (74.0f + var * 30.0f) * k;
                 b = (66.0f + var * 26.0f) * k;
                 if (tx == 0 || ty == 0) { r = 22.0f; g = 20.0f; b = 18.0f; }
-                g_tex[T_FLOOR][y * TEX_SIZE + x] = pack_rgb(r, g, b);
+                g_tex[T_FLOOR][y * TEX_SIZE + x] = pack565(r, g, b);
             }
             /* --- потолок: тёмные панели --- */
             {
                 float k = (0.5f + 0.7f * n) * (0.9f + 0.2f * fine);
                 r = 70.0f * k; g = 68.0f * k; b = 62.0f * k;
                 if ((x % 32) == 0 || (y % 32) == 0) { r *= 0.35f; g *= 0.35f; b *= 0.35f; }
-                g_tex[T_CEIL][y * TEX_SIZE + x] = pack_rgb(r, g, b);
+                g_tex[T_CEIL][y * TEX_SIZE + x] = pack565(r, g, b);
             }
             /* --- дерево: горизонтальные доски --- */
             {
@@ -317,7 +346,7 @@ static void gen_textures(void)
                 float k = 0.6f + 0.6f * grain;
                 r = 118.0f * k; g = 80.0f * k; b = 46.0f * k;
                 if ((y % 16) == 0) { r = 25.0f; g = 16.0f; b = 8.0f; }
-                g_tex[T_WOOD][y * TEX_SIZE + x] = pack_rgb(r, g, b);
+                g_tex[T_WOOD][y * TEX_SIZE + x] = pack565(r, g, b);
             }
             /* --- металл с ржавчиной (двери) --- */
             {
@@ -328,7 +357,7 @@ static void gen_textures(void)
                 g = lerpf(g, 64.0f * k, rust);
                 b = lerpf(b, 30.0f * k, rust);
                 if (x < 3 || x > 60 || y < 3 || y > 60 || y == 32) { r *= 0.4f; g *= 0.4f; b *= 0.4f; }
-                g_tex[T_METAL][y * TEX_SIZE + x] = pack_rgb(r, g, b);
+                g_tex[T_METAL][y * TEX_SIZE + x] = pack565(r, g, b);
             }
             /* --- бумага с «текстом» --- */
             {
@@ -337,10 +366,12 @@ static void gen_textures(void)
                 if ((y % 6) == 3 && x > 6 && x < 58 && (hash2(x / 3, y / 6) & 3u) != 0u) {
                     r = 40.0f; g = 38.0f; b = 36.0f;
                 }
-                g_tex[T_PAPER][y * TEX_SIZE + x] = pack_rgb(r, g, b);
+                g_tex[T_PAPER][y * TEX_SIZE + x] = pack565(r, g, b);
             }
         }
     }
+    for (int t = 0; t < T_COUNT; t++)
+        swizzle_tex((unsigned char *)g_texSw[t], (const unsigned char *)g_tex[t], TEX_SIZE * 2, TEX_SIZE);
     sceKernelDcacheWritebackAll();
 }
 
@@ -372,6 +403,15 @@ static Mesh mMetal = { vMetal, 0, 1200 };
 static Mesh mPaper = { vPaper, 0, 60 };
 static Mesh mDoor  = { vDoor,  0, 120 };
 
+/* Зоны уровня для отсечения: диапазоны вершин внутри каждой сетки.
+   Порядок сеток = порядок текстур: стена, пол, потолок, дерево, металл, бумага. */
+enum { Z_CORR, Z_ROOM, Z_PASS, Z_COUNT };
+static Mesh *const g_zMeshes[6] = { &mWall, &mFloor, &mCeil, &mWood, &mMetal, &mPaper };
+static int g_zStart[Z_COUNT][6], g_zEnd[Z_COUNT][6];
+
+static void zone_begin(int z) { for (int i = 0; i < 6; i++) g_zStart[z][i] = g_zMeshes[i]->n; }
+static void zone_end(int z)   { for (int i = 0; i < 6; i++) g_zEnd[z][i]   = g_zMeshes[i]->n; }
+
 #define WALL_H 2.8f
 #define TILE   1.0f
 #define TILE_V 0.7f
@@ -385,8 +425,18 @@ static u32 tint(void)
 /* p[i] = { x, y, z, u, v } */
 static void mesh_quad(Mesh *m, const float p[4][5], float nx, float ny, float nz, u32 col)
 {
-    static const int idx[6] = { 0, 1, 2, 0, 2, 3 };
+    static const int idxA[6] = { 0, 1, 2, 0, 2, 3 };
+    static const int idxB[6] = { 0, 2, 1, 0, 3, 2 };
+    const int *idx = idxA;
     if (m->n + 6 > m->cap) return;
+    {
+        float e1x = p[1][0] - p[0][0], e1y = p[1][1] - p[0][1], e1z = p[1][2] - p[0][2];
+        float e2x = p[2][0] - p[0][0], e2y = p[2][1] - p[0][1], e2z = p[2][2] - p[0][2];
+        float gx = e1y * e2z - e1z * e2y;
+        float gy = e1z * e2x - e1x * e2z;
+        float gz = e1x * e2y - e1y * e2x;
+        if (gx * nx + gy * ny + gz * nz < 0.0f) idx = idxB;
+    }
     for (int i = 0; i < 6; i++) {
         const float *q = p[idx[i]];
         LVertex *o = &m->v[m->n++];
@@ -496,25 +546,33 @@ static const Rect g_solid[] = {
 
 static void build_level(void)
 {
-    /* коридор */
+    /* ---------- зона 0: коридор ---------- */
+    zone_begin(Z_CORR);
     wall_tiles(&mWall, -1.5f,   0.0f, -1.5f, -24.0f, 0.0f, WALL_H,  1.0f, 0.0f);   /* запад */
     wall_tiles(&mWall,  1.5f,   0.0f,  1.5f, -10.3f, 0.0f, WALL_H, -1.0f, 0.0f);   /* восток, до проёма */
     wall_tiles(&mWall,  1.5f, -11.7f,  1.5f, -24.0f, 0.0f, WALL_H, -1.0f, 0.0f);   /* восток, после проёма */
     wall_tiles(&mWall, -1.5f,   0.0f,  1.5f,   0.0f, 0.0f, WALL_H,  0.0f, -1.0f);  /* задняя */
-    /* торец с дверным проёмом */
-    wall_tiles(&mWall, -1.5f, -24.0f, -0.9f, -24.0f, 0.0f, WALL_H,  0.0f, 1.0f);
+    wall_tiles(&mWall, -1.5f, -24.0f, -0.9f, -24.0f, 0.0f, WALL_H,  0.0f, 1.0f);   /* торец с проёмом */
     wall_tiles(&mWall,  0.9f, -24.0f,  1.5f, -24.0f, 0.0f, WALL_H,  0.0f, 1.0f);
     wall_tiles(&mWall, -0.9f, -24.0f,  0.9f, -24.0f, 2.2f, WALL_H,  0.0f, 1.0f);
     plane_tiles(&mFloor, -1.5f, -24.0f, 1.5f, 0.0f, 0.0f,    1.0f);
     plane_tiles(&mCeil,  -1.5f, -24.0f, 1.5f, 0.0f, WALL_H, -1.0f);
+    {
+        const float zs[4] = { -5.0f, -8.5f, -17.0f, -20.5f };
+        for (int i = 0; i < 4; i++)
+            box3d(&mMetal, -1.5f, 0.0f, zs[i] - 0.5f, -1.44f, 2.1f, zs[i] + 0.5f);
+        box3d(&mMetal, 1.44f, 0.0f, -17.5f, 1.5f, 2.1f, -16.5f);
+        box3d(&mMetal, 1.44f, 0.0f, -21.0f, 1.5f, 2.1f, -20.0f);
+    }
+    zone_end(Z_CORR);
 
-    /* проход в комнату */
+    /* ---------- зона 1: проход, комната, ящик, записка ---------- */
+    zone_begin(Z_ROOM);
     wall_tiles(&mWall, 1.5f, -11.7f, 2.0f, -11.7f, 0.0f, WALL_H, 0.0f,  1.0f);
     wall_tiles(&mWall, 1.5f, -10.3f, 2.0f, -10.3f, 0.0f, WALL_H, 0.0f, -1.0f);
     plane_tiles(&mFloor, 1.5f, -11.7f, 2.0f, -10.3f, 0.0f,    1.0f);
     plane_tiles(&mCeil,  1.5f, -11.7f, 2.0f, -10.3f, WALL_H, -1.0f);
 
-    /* комната */
     plane_tiles(&mFloor, 2.0f, -14.0f, 6.5f, -8.0f, 0.0f,    1.0f);
     plane_tiles(&mCeil,  2.0f, -14.0f, 6.5f, -8.0f, WALL_H, -1.0f);
     wall_tiles(&mWall, 2.0f, -14.0f, 2.0f, -11.7f, 0.0f, WALL_H,  1.0f, 0.0f);
@@ -523,28 +581,9 @@ static void build_level(void)
     wall_tiles(&mWall, 2.0f, -14.0f, 6.5f, -14.0f, 0.0f, WALL_H,  0.0f,  1.0f);
     wall_tiles(&mWall, 2.0f,  -8.0f, 6.5f,  -8.0f, 0.0f, WALL_H,  0.0f, -1.0f);
 
-    /* коридор за дверью */
-    wall_tiles(&mWall, -0.9f, -24.0f, -0.9f, -30.0f, 0.0f, WALL_H,  1.0f, 0.0f);
-    wall_tiles(&mWall,  0.9f, -24.0f,  0.9f, -30.0f, 0.0f, WALL_H, -1.0f, 0.0f);
-    wall_tiles(&mWall, -0.9f, -30.0f,  0.9f, -30.0f, 0.0f, WALL_H,  0.0f,  1.0f);
-    plane_tiles(&mFloor, -0.9f, -30.0f, 0.9f, -24.0f, 0.0f,    1.0f);
-    plane_tiles(&mCeil,  -0.9f, -30.0f, 0.9f, -24.0f, WALL_H, -1.0f);
-
-    /* ящик */
-    box3d(&mWood, 4.8f, 0.0f, -13.4f, 5.8f, 0.8f, -12.4f);
-
-    /* декоративные закрытые двери */
+    box3d(&mWood, 4.8f, 0.0f, -13.4f, 5.8f, 0.8f, -12.4f);   /* ящик */
     {
-        const float zs[4] = { -5.0f, -8.5f, -17.0f, -20.5f };
-        for (int i = 0; i < 4; i++)
-            box3d(&mMetal, -1.5f, 0.0f, zs[i] - 0.5f, -1.44f, 2.1f, zs[i] + 0.5f);
-        box3d(&mMetal, 1.44f, 0.0f, -17.5f, 1.5f, 2.1f, -16.5f);
-        box3d(&mMetal, 1.44f, 0.0f, -21.0f, 1.5f, 2.1f, -20.0f);
-    }
-
-    /* записка на стене комнаты (z = -8, интерьер смотрит в -z) */
-    {
-        float p[4][5] = {
+        float p[4][5] = {                                   /* записка */
             { 3.45f, 1.30f, -8.01f, 0.0f, 1.0f },
             { 3.00f, 1.30f, -8.01f, 1.0f, 1.0f },
             { 3.00f, 1.75f, -8.01f, 1.0f, 0.0f },
@@ -552,8 +591,18 @@ static void build_level(void)
         };
         mesh_quad(&mPaper, p, 0.0f, 0.0f, -1.0f, COL(255, 255, 255));
     }
+    zone_end(Z_ROOM);
 
-    /* запертая дверь (двигается вверх при открытии) */
+    /* ---------- зона 2: коридор за дверью ---------- */
+    zone_begin(Z_PASS);
+    wall_tiles(&mWall, -0.9f, -24.0f, -0.9f, -30.0f, 0.0f, WALL_H,  1.0f, 0.0f);
+    wall_tiles(&mWall,  0.9f, -24.0f,  0.9f, -30.0f, 0.0f, WALL_H, -1.0f, 0.0f);
+    wall_tiles(&mWall, -0.9f, -30.0f,  0.9f, -30.0f, 0.0f, WALL_H,  0.0f,  1.0f);
+    plane_tiles(&mFloor, -0.9f, -30.0f, 0.9f, -24.0f, 0.0f,    1.0f);
+    plane_tiles(&mCeil,  -0.9f, -30.0f, 0.9f, -24.0f, WALL_H, -1.0f);
+    zone_end(Z_PASS);
+
+    /* запертая дверь (отдельная сетка, двигается вверх) */
     box3d(&mDoor, -0.9f, 0.0f, -24.0f, 0.9f, 2.2f, -23.92f);
 
     sceKernelDcacheWritebackAll();
@@ -593,6 +642,8 @@ static void ring_pt(float *o, float cx, float cy, float cz,
 static void tube(CMesh *m, float ax, float ay, float az, float bx, float by, float bz,
                  float ra, float rb, int sides, int cr, int cg, int cb, float br)
 {
+    sides = (sides * 3 + 2) / 4;          /* 8->6, 6->5: меньше полигонов */
+    if (sides < 3) sides = 3;
     float d[3] = { bx - ax, by - ay, bz - az };
     float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
     if (len < 1e-5f) return;
@@ -731,10 +782,18 @@ static void text_pass(const char *s, float x, float y, float sc, u32 col)
         for (int g = 0; g < NUM_GLYPHS; g++)
             if (g_font[g].c == ch) { rows = g_font[g].r; break; }
         if (rows) {
-            for (int r = 0; r < 5; r++)
-                for (int c = 0; c < 3; c++)
-                    if ((rows[r] >> (2 - c)) & 1)
-                        hud_quad(x + c * sc, y + r * sc, x + (c + 1) * sc, y + (r + 1) * sc, col);
+            for (int r = 0; r < 5; r++) {
+                int c = 0;
+                while (c < 3) {
+                    if ((rows[r] >> (2 - c)) & 1) {
+                        int c0 = c;
+                        while (c < 3 && ((rows[r] >> (2 - c)) & 1)) c++;
+                        hud_quad(x + c0 * sc, y + r * sc, x + c * sc, y + (r + 1) * sc, col);
+                    } else {
+                        c++;
+                    }
+                }
+            }
         }
         x += 4.0f * sc;
     }
@@ -769,6 +828,8 @@ static char  g_msg[80];
 static float g_msgT;
 static float g_dripT, g_thudT;
 static float g_lamp, g_lampBurst, g_lampNext;
+static int   g_cull, g_showDbg, g_lock30;
+static float g_fps, g_ms;
 
 #define EYE_HEIGHT   1.6f
 #define MOVE_SPEED   2.0f
@@ -987,7 +1048,7 @@ static void update_world(float dt)
 /* ================================================================== */
 /* GU                                                                  */
 /* ================================================================== */
-static unsigned int g_list[262144] __attribute__((aligned(16)));
+static unsigned int g_list[65536] __attribute__((aligned(16)));
 
 static void init_gu(void)
 {
@@ -1006,7 +1067,7 @@ static void init_gu(void)
     sceGuFrontFace(GU_CW);
     sceGuDisable(GU_CULL_FACE);
     sceGuShadeModel(GU_SMOOTH);
-    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexMode(GU_PSM_5650, 0, 0, 1);
     sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGB);
     sceGuTexFilter(GU_LINEAR, GU_LINEAR);
     sceGuTexWrap(GU_REPEAT, GU_REPEAT);
@@ -1018,11 +1079,22 @@ static void init_gu(void)
     sceGuDisplay(GU_TRUE);
 }
 
-static void draw_mesh(int tex, const Mesh *m)
+static int g_triCount = 0;
+
+static void draw_range(int tex, const Mesh *m, int s, int e)
 {
-    if (m->n <= 0) return;
-    sceGuTexImage(0, TEX_SIZE, TEX_SIZE, TEX_SIZE, g_tex[tex]);
-    sceGumDrawArray(GU_TRIANGLES, LV_FLAGS, m->n, 0, m->v);
+    if (e <= s) return;
+    sceGuTexImage(0, TEX_SIZE, TEX_SIZE, TEX_SIZE, g_texSw[tex]);
+    sceGumDrawArray(GU_TRIANGLES, LV_FLAGS, e - s, 0, m->v + s);
+    g_triCount += (e - s) / 3;
+}
+
+static void draw_mesh(int tex, const Mesh *m) { draw_range(tex, m, 0, m->n); }
+
+static void draw_zone(int z)
+{
+    for (int i = 0; i < 6; i++)
+        draw_range(i, g_zMeshes[i], g_zStart[z][i], g_zEnd[z][i]);
 }
 
 static void render(int target)
@@ -1041,15 +1113,17 @@ static void render(int target)
     float cy = EYE_HEIGHT + (0.5f - fabsf(sinf(p->bobPhase))) * 0.07f * p->bobAmp;
 
     /* ---------------- мир ---------------- */
+    g_triCount = 0;
     sceGuEnable(GU_DEPTH_TEST);
     sceGuDisable(GU_BLEND);
+    if (g_cull) sceGuEnable(GU_CULL_FACE); else sceGuDisable(GU_CULL_FACE);
     sceGuEnable(GU_FOG);
     sceGuFog(1.5f, 16.0f, 0x00000000);
     sceGuEnable(GU_TEXTURE_2D);
 
     sceGumMatrixMode(GU_PROJECTION);
     sceGumLoadIdentity();
-    sceGumPerspective(75.0f, 16.0f / 9.0f, 0.2f, 40.0f);
+    sceGumPerspective(75.0f, 16.0f / 9.0f, 0.2f, 18.0f);
 
     sceGumMatrixMode(GU_VIEW);
     sceGumLoadIdentity();
@@ -1085,7 +1159,7 @@ static void render(int target)
         }
     }
     /* свет 1: сломанная лампа на потолке коридора */
-    if (g_lamp > 0.1f) {
+    if (g_lamp > 0.1f && fabsf(p->z + 14.0f) < 14.0f) {
         ScePspFVector3 lp1 = { 0.0f, 2.6f, -14.0f };
         int r = (int)(110.0f * g_lamp), g = (int)(140.0f * g_lamp), b = (int)(100.0f * g_lamp);
         sceGuEnable(GU_LIGHT1);
@@ -1096,12 +1170,14 @@ static void render(int target)
         sceGuDisable(GU_LIGHT1);
     }
 
-    draw_mesh(T_WALL,  &mWall);
-    draw_mesh(T_FLOOR, &mFloor);
-    draw_mesh(T_CEIL,  &mCeil);
-    draw_mesh(T_WOOD,  &mWood);
-    draw_mesh(T_METAL, &mMetal);
-    draw_mesh(T_PAPER, &mPaper);
+    {
+        /* отсечение по зонам: комнату рисуем только если она может быть видна,
+           проход за дверью — только когда дверь начала открываться */
+        int roomVisible = (p->x > 1.4f) || (p->z > -17.0f && p->z < -5.0f);
+        draw_zone(Z_CORR);
+        if (roomVisible) draw_zone(Z_ROOM);
+        if (g_doorT > 0.0f) draw_zone(Z_PASS);
+    }
 
     /* дверь уезжает вверх */
     {
@@ -1113,6 +1189,7 @@ static void render(int target)
         sceGumLoadIdentity();
     }
 
+    sceGuDisable(GU_CULL_FACE);
     sceGuDisable(GU_LIGHTING);
     sceGuDisable(GU_LIGHT0);
     sceGuDisable(GU_LIGHT1);
@@ -1153,8 +1230,10 @@ static void render(int target)
         ScePspFVector3 vt = { bx, by, 0.0f };
         sceGumTranslate(&vt);
     }
-    if (mVm.n > 0)
+    if (mVm.n > 0) {
         sceGumDrawArray(GU_TRIANGLES, CV_FLAGS, mVm.n, 0, mVm.v);
+        g_triCount += mVm.n / 3;
+    }
 
     /* ---------------- HUD ---------------- */
     g_hudN = 0;
@@ -1184,6 +1263,17 @@ static void render(int target)
             if (g_endT > 5.0f)
                 draw_text("X - RESTART", cxs, cys + 40.0f, 2.0f, COLA(150, 150, 150, 255), 1);
         }
+    }
+    if (g_showDbg) {
+        char line[64];
+        snprintf(line, sizeof(line), "FPS %d  MS %d", (int)(g_fps + 0.5f), (int)(g_ms + 0.5f));
+        draw_text(line, 6.0f, 6.0f, 2.0f, COLA(120, 255, 120, 230), 0);
+        snprintf(line, sizeof(line), "TRIS %d", g_triCount);
+        draw_text(line, 6.0f, 20.0f, 2.0f, COLA(120, 255, 120, 230), 0);
+        snprintf(line, sizeof(line), "FREE MEM %d KB", (int)(sceKernelTotalFreeMemSize() / 1024));
+        draw_text(line, 6.0f, 34.0f, 2.0f, COLA(120, 255, 120, 230), 0);
+        snprintf(line, sizeof(line), "CULL %s  LOCK30 %s", g_cull ? "ON" : "OFF", g_lock30 ? "ON" : "OFF");
+        draw_text(line, 6.0f, 48.0f, 2.0f, COLA(120, 255, 120, 230), 0);
     }
     if (g_hudN > 0) {
         sceKernelDcacheWritebackRange(g_hud, sizeof(CVertex) * (unsigned)g_hudN);
@@ -1217,11 +1307,14 @@ int main(int argc, char *argv[])
     init_gu();
     start_audio();
     reset_game();
+    g_lock30 = 1;
 
     SceCtrlData pad;
     memset(&pad, 0, sizeof(pad));
     unsigned int oldButtons = 0;
     u32 lastTime = sceKernelGetSystemTimeLow();
+    float fpsAcc = 0.0f;
+    int fpsFrames = 0;
 
     while (1) {
         u32 now = sceKernelGetSystemTimeLow();
@@ -1229,9 +1322,20 @@ int main(int argc, char *argv[])
         lastTime = now;
         if (dt > 0.1f) dt = 0.1f;
 
+        fpsAcc += dt; fpsFrames++;
+        if (fpsAcc >= 0.5f) {
+            g_fps = (float)fpsFrames / fpsAcc;
+            g_ms = 1000.0f * fpsAcc / (float)fpsFrames;
+            fpsAcc = 0.0f; fpsFrames = 0;
+        }
+
         sceCtrlPeekBufferPositive(&pad, 1);
         unsigned int pressed = pad.Buttons & ~oldButtons;
         oldButtons = pad.Buttons;
+
+        if (pressed & PSP_CTRL_TRIANGLE) g_showDbg = !g_showDbg;   /* отладочная статистика */
+        if (pressed & PSP_CTRL_SELECT)   g_cull = !g_cull;         /* отсечение граней */
+        if (pressed & PSP_CTRL_CIRCLE)   g_lock30 = !g_lock30;     /* лок 30 FPS */
 
         int target = I_NONE;
 
@@ -1264,6 +1368,7 @@ int main(int argc, char *argv[])
         }
 
         render(target);
+        if (g_lock30) sceDisplayWaitVblankStart();   /* итого 30 FPS */
     }
 
     g_audioRun = 0;
